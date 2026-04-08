@@ -1,0 +1,384 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
+
+use common_daft_config::DaftExecutionConfig;
+use common_display::{DisplayLevel, mermaid::MermaidDisplayOptions};
+use common_error::DaftResult;
+use common_metrics::{QueryEndState, QueryPlan};
+use common_runtime::RuntimeTask;
+use common_tracing::flush_opentelemetry_providers;
+use daft_context::{DaftContext, Subscriber};
+use daft_local_plan::{ExecutionStats, Input, InputId, LocalPhysicalPlanRef, SourceId, translate};
+use daft_logical_plan::LogicalPlanBuilder;
+use daft_micropartition::MicroPartition;
+use futures::{FutureExt, future::BoxFuture};
+use tokio::{runtime::Handle, sync::Mutex};
+use tokio_util::sync::CancellationToken;
+#[cfg(feature = "python")]
+use {
+    common_daft_config::PyDaftExecutionConfig,
+    daft_context::python::PyDaftContext,
+    daft_local_plan::python::PyExecutionStats,
+    daft_logical_plan::PyLogicalPlanBuilder,
+    daft_micropartition::python::PyMicroPartition,
+    pyo3::{Bound, PyAny, PyRef, PyResult, Python, pyclass, pymethods},
+};
+
+use crate::{
+    ExecutionRuntimeContext,
+    channel::{Receiver, create_channel},
+    pipeline::{
+        BuilderContext, translate_physical_plan_to_pipeline, viz_pipeline_ascii,
+        viz_pipeline_mermaid,
+    },
+    resource_manager::get_or_init_memory_manager,
+    runtime_stats::RuntimeStatsManager,
+};
+
+/// Global tokio runtime shared by all NativeExecutor instances
+static GLOBAL_RUNTIME: OnceLock<Handle> = OnceLock::new();
+
+/// Get or initialize the global tokio runtime
+#[cfg(feature = "python")]
+fn get_global_runtime() -> &'static Handle {
+    GLOBAL_RUNTIME.get_or_init(|| {
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_all();
+        pyo3_async_runtimes::tokio::init(builder);
+        std::thread::spawn(move || {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(futures::future::pending::<()>());
+        });
+        pyo3_async_runtimes::tokio::get_runtime().handle().clone()
+    })
+}
+
+#[cfg(not(feature = "python"))]
+fn get_global_runtime() -> &'static Handle {
+    unimplemented!("get_global_runtime is not implemented without python feature");
+}
+
+pub(crate) struct EnqueueInputMessage {
+    /// The input_id for this enqueue operation
+    input_id: InputId,
+    /// Plan inputs grouped by source_id
+    inputs: HashMap<SourceId, Input>,
+}
+
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "daft.daft", name = "NativeExecutor", frozen)
+)]
+pub struct PyNativeExecutor {
+    executor: NativeExecutor,
+}
+
+#[cfg(feature = "python")]
+impl Default for PyNativeExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyNativeExecutor {
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            executor: NativeExecutor::new(),
+        }
+    }
+
+    #[pyo3(signature = (local_physical_plan, daft_ctx, input_id, inputs, context=None))]
+    pub fn run<'py>(
+        &self,
+        py: Python<'py>,
+        local_physical_plan: &daft_local_plan::PyLocalPhysicalPlan,
+        daft_ctx: &PyDaftContext,
+        input_id: InputId,
+        inputs: HashMap<SourceId, Input>,
+        context: Option<HashMap<String, String>>,
+    ) -> PyResult<Bound<'py, pyo3::PyAny>> {
+        let daft_ctx: &DaftContext = daft_ctx.into();
+        let plan = local_physical_plan.plan.clone();
+        let exec_cfg = daft_ctx.execution_config();
+        let subscribers = daft_ctx.subscribers();
+        let enqueue_future = {
+            self.executor
+                .run(&plan, exec_cfg, subscribers, context, input_id, inputs)?
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = enqueue_future.await;
+            Ok(PyExecutionEngineResult {
+                result: Arc::new(Mutex::new(Some(result))),
+            })
+        })
+    }
+
+    #[staticmethod]
+    pub fn repr_ascii(
+        logical_plan_builder: &PyLogicalPlanBuilder,
+        cfg: PyDaftExecutionConfig,
+        simple: bool,
+    ) -> PyResult<String> {
+        Ok(NativeExecutor::repr_ascii(
+            &logical_plan_builder.builder,
+            cfg.config,
+            simple,
+        ))
+    }
+
+    #[staticmethod]
+    pub fn repr_mermaid(
+        logical_plan_builder: &PyLogicalPlanBuilder,
+        cfg: PyDaftExecutionConfig,
+        options: MermaidDisplayOptions,
+    ) -> PyResult<String> {
+        Ok(NativeExecutor::repr_mermaid(
+            &logical_plan_builder.builder,
+            cfg.config,
+            options,
+        ))
+    }
+}
+
+pub(crate) struct NativeExecutor {
+    cancel: CancellationToken,
+}
+
+impl NativeExecutor {
+    pub fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    pub fn run(
+        &self,
+        local_physical_plan: &LocalPhysicalPlanRef,
+        exec_cfg: Arc<DaftExecutionConfig>,
+        subscribers: Vec<Arc<dyn Subscriber>>,
+        additional_context: Option<HashMap<String, String>>,
+        input_id: InputId,
+        inputs: HashMap<SourceId, Input>,
+    ) -> DaftResult<BoxFuture<'static, ExecutionEngineResult>> {
+        let cancel = self.cancel.clone();
+        let additional_context = additional_context.unwrap_or_default();
+
+        let query_id: common_metrics::QueryID = additional_context
+            .get("query_id")
+            .ok_or_else(|| {
+                common_error::DaftError::ValueError(
+                    "query_id not found in additional_context".to_string(),
+                )
+            })?
+            .clone()
+            .into();
+
+        let ctx = BuilderContext::new_with_context(query_id.clone(), additional_context);
+        let (pipeline, input_senders) =
+            translate_physical_plan_to_pipeline(local_physical_plan.as_ref(), &exec_cfg, &ctx)?;
+        let plan_json = pipeline.repr_json();
+
+        let (tx, rx) = create_channel(1);
+
+        // Spawn execution on the global runtime - returns immediately
+        let handle = get_global_runtime();
+        let stats_manager = RuntimeStatsManager::try_new(handle, &pipeline, subscribers, query_id)?;
+
+        let (enqueue_input_tx, mut enqueue_input_rx) = create_channel::<EnqueueInputMessage>(1);
+
+        let task = async move {
+            let stats_manager_handle = stats_manager.handle();
+            let execution_task = async {
+                let memory_manager = get_or_init_memory_manager();
+                let mut runtime_handle =
+                    ExecutionRuntimeContext::new(memory_manager.clone(), stats_manager_handle);
+                let mut receiver = pipeline.start(true, &mut runtime_handle)?;
+
+                if let Some(message) = enqueue_input_rx.recv().await {
+                    for (key, plan_input) in message.inputs {
+                        if let Some(sender) = input_senders.get(&key) {
+                            let _ = sender.send(message.input_id, plan_input);
+                        }
+                    }
+                }
+                drop(input_senders);
+
+                while let Some(val) = receiver.recv().await {
+                    if tx.send(val).await.is_err() {
+                        runtime_handle.shutdown().await?;
+                        return Ok(());
+                    }
+                }
+
+                runtime_handle.shutdown().await
+            };
+
+            let (result, finish_status) = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    log::info!("Execution engine cancelled");
+                    (Ok(()), QueryEndState::Canceled)
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!("Received Ctrl-C, shutting down execution engine");
+                    (Ok(()), QueryEndState::Canceled)
+                }
+                result = execution_task => {
+                    let status = if result.is_err() {
+                        QueryEndState::Failed
+                    } else {
+                        QueryEndState::Finished
+                    };
+                    (result, status)
+                },
+            };
+
+            // Finish the stats manager
+            let final_stats = stats_manager.finish(finish_status).await;
+
+            flush_opentelemetry_providers();
+            result.map(|()| final_stats)
+        };
+
+        let handle = RuntimeTask::new(handle, task);
+
+        Ok(async move {
+            let enqueue_msg = EnqueueInputMessage { input_id, inputs };
+
+            let _ = enqueue_input_tx.send(enqueue_msg).await;
+            ExecutionEngineResult {
+                query_plan: serde_json::to_string(&plan_json).unwrap().into(),
+                handle,
+                receiver: rx,
+            }
+        }
+        .boxed())
+    }
+
+    fn repr_ascii(
+        logical_plan_builder: &LogicalPlanBuilder,
+        cfg: Arc<DaftExecutionConfig>,
+        simple: bool,
+    ) -> String {
+        let logical_plan = logical_plan_builder.build();
+        let (physical_plan, _) = translate(&logical_plan, &HashMap::new()).unwrap();
+        let ctx = BuilderContext::new();
+        let (pipeline_node, _) =
+            translate_physical_plan_to_pipeline(&physical_plan, &cfg, &ctx).unwrap();
+
+        viz_pipeline_ascii(pipeline_node.as_ref(), simple)
+    }
+
+    fn repr_mermaid(
+        logical_plan_builder: &LogicalPlanBuilder,
+        cfg: Arc<DaftExecutionConfig>,
+        options: MermaidDisplayOptions,
+    ) -> String {
+        let logical_plan = logical_plan_builder.build();
+        let (physical_plan, _) = translate(&logical_plan, &HashMap::new()).unwrap();
+        let ctx = BuilderContext::new();
+        let (pipeline_node, _) =
+            translate_physical_plan_to_pipeline(&physical_plan, &cfg, &ctx).unwrap();
+
+        let display_type = if options.simple {
+            DisplayLevel::Compact
+        } else {
+            DisplayLevel::Default
+        };
+        viz_pipeline_mermaid(
+            pipeline_node.as_ref(),
+            display_type,
+            options.bottom_up,
+            options.subgraph_options,
+        )
+    }
+}
+
+impl Drop for NativeExecutor {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+pub struct ExecutionEngineResult {
+    query_plan: QueryPlan,
+    handle: RuntimeTask<DaftResult<ExecutionStats>>,
+    receiver: Receiver<Arc<MicroPartition>>,
+}
+
+impl ExecutionEngineResult {
+    async fn next(&mut self) -> Option<Arc<MicroPartition>> {
+        self.receiver.recv().await
+    }
+
+    async fn finish(self) -> DaftResult<ExecutionStats> {
+        drop(self.receiver);
+        let result = self.handle.await;
+        match result {
+            Ok(Ok(final_stats)) => Ok(final_stats),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "daft.daft", name = "PyExecutionEngineResult", frozen)
+)]
+pub struct PyExecutionEngineResult {
+    result: Arc<Mutex<Option<ExecutionEngineResult>>>,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyExecutionEngineResult {
+    fn query_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let result = self.result.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = result.lock().await;
+            let query_plan = result
+                .as_ref()
+                .expect("ExecutionEngineResult.query_plan() should not be called after finish().")
+                .query_plan
+                .clone()
+                .to_string();
+            Ok(query_plan)
+        })
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, pyo3::PyAny>> {
+        let result = self.result.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut result = result.lock().await;
+            let part = result
+                .as_mut()
+                .expect("ExecutionEngineResult.__anext__() should not be called after finish().")
+                .next()
+                .await;
+            Ok(part.map(PyMicroPartition::from))
+        })
+    }
+
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let result = self.result.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut result = result.lock().await;
+            let stats = result
+                .take()
+                .expect("ExecutionEngineResult.finish() should not be called more than once.")
+                .finish()
+                .await?;
+            Ok(PyExecutionStats::from(stats))
+        })
+    }
+}
