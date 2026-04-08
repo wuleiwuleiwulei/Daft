@@ -1,0 +1,380 @@
+use std::sync::Arc;
+
+use arrow::array::{BooleanBufferBuilder, LargeBinaryArray, OffsetBufferBuilder};
+use base64::Engine;
+use common_error::{DaftError, DaftResult};
+use common_image::{BBox, CowImage};
+use daft_core::{
+    array::{
+        ops::image::{
+            AsImageObj, fixed_image_array_from_img_buffers, image_array_from_img_buffers,
+        },
+        prelude::*,
+    },
+    datatypes::prelude::*,
+    prelude::ImageArray,
+};
+use daft_schema::image_property::ImageProperty;
+use rayon::prelude::*;
+
+use crate::{CountingWriter, iters::ImageBufferIter};
+
+pub trait ImageOps {
+    fn encode(&self, image_format: ImageFormat) -> DaftResult<BinaryArray>;
+    fn resize(&self, w: u32, h: u32) -> DaftResult<Self>
+    where
+        Self: Sized;
+    fn crop(&self, bboxes: &FixedSizeListArray) -> DaftResult<ImageArray>
+    where
+        Self: Sized;
+    fn resize_to_fixed_shape_image_array(
+        &self,
+        w: u32,
+        h: u32,
+        mode: &ImageMode,
+    ) -> DaftResult<FixedShapeImageArray>;
+    fn to_mode(&self, mode: ImageMode) -> DaftResult<Self>
+    where
+        Self: Sized;
+    fn attribute(&self, attr: ImageProperty) -> DaftResult<DataArray<UInt32Type>>;
+}
+
+impl ImageOps for ImageArray {
+    fn encode(&self, image_format: ImageFormat) -> DaftResult<BinaryArray> {
+        encode_images(self, image_format)
+    }
+
+    fn resize(&self, w: u32, h: u32) -> DaftResult<Self> {
+        let result = resize_images(self, w, h);
+        image_array_from_img_buffers(self.name(), result.into_iter(), self.image_mode())
+    }
+
+    fn crop(&self, bboxes: &FixedSizeListArray) -> DaftResult<ImageArray> {
+        let mut bboxes_iterator: Box<dyn Iterator<Item = Option<BBox>>> = if bboxes.len() == 1 {
+            Box::new(std::iter::repeat(bboxes.get(0).map(|bbox| {
+                let data = bbox.u32().unwrap();
+                bbox_from_u32_arrow_array(data)
+            })))
+        } else {
+            Box::new((0..bboxes.len()).map(|i| {
+                bboxes
+                    .get(i)
+                    .map(|bbox| bbox_from_u32_arrow_array(bbox.u32().unwrap()))
+            }))
+        };
+        let result = crop_images(self, &mut bboxes_iterator);
+        image_array_from_img_buffers(self.name(), result.into_iter(), self.image_mode())
+    }
+
+    fn resize_to_fixed_shape_image_array(
+        &self,
+        w: u32,
+        h: u32,
+        mode: &ImageMode,
+    ) -> DaftResult<FixedShapeImageArray> {
+        let result = resize_images(self, w, h);
+        fixed_image_array_from_img_buffers(self.name(), result.as_slice(), mode, h, w)
+    }
+
+    fn to_mode(&self, mode: ImageMode) -> DaftResult<Self> {
+        let buffers: Vec<Option<CowImage>> = (0..self.len())
+            .into_par_iter()
+            .map(|i| self.as_image_obj(i).map(|img| img.into_mode(mode)))
+            .collect();
+        image_array_from_img_buffers(self.name(), buffers.into_iter(), Some(mode))
+    }
+
+    fn attribute(&self, attr: ImageProperty) -> DaftResult<DataArray<UInt32Type>> {
+        match attr {
+            ImageProperty::Height => Ok(self.heights().clone().rename(self.name())),
+            ImageProperty::Width => Ok(self.widths().clone().rename(self.name())),
+            ImageProperty::Channel => Ok(self
+                .channels()
+                .clone()
+                .cast(&DataType::UInt32)?
+                .u32()?
+                .clone()
+                .rename(self.name())),
+            ImageProperty::Mode => Ok(self
+                .modes()
+                .clone()
+                .cast(&DataType::UInt32)?
+                .u32()?
+                .clone()
+                .rename(self.name())),
+        }
+    }
+}
+
+fn bbox_from_u32_arrow_array(arr: &UInt32Array) -> BBox {
+    assert!(arr.len() == 4);
+
+    let slice = arr.as_slice();
+
+    BBox(slice[0], slice[1], slice[2], slice[3])
+}
+impl ImageOps for FixedShapeImageArray {
+    fn encode(&self, image_format: ImageFormat) -> DaftResult<BinaryArray> {
+        encode_images(self, image_format)
+    }
+
+    fn resize(&self, w: u32, h: u32) -> DaftResult<Self>
+    where
+        Self: Sized,
+    {
+        let result = resize_images(self, w, h);
+        let mode = self.image_mode();
+        fixed_image_array_from_img_buffers(self.name(), result.as_slice(), mode, h, w)
+    }
+
+    fn crop(&self, bboxes: &FixedSizeListArray) -> DaftResult<ImageArray>
+    where
+        Self: Sized,
+    {
+        let mut bboxes_iterator: Box<dyn Iterator<Item = Option<BBox>>> = if bboxes.len() == 1 {
+            Box::new(std::iter::repeat(
+                bboxes
+                    .get(0)
+                    .map(|bbox| bbox_from_u32_arrow_array(bbox.u32().unwrap())),
+            ))
+        } else {
+            Box::new((0..bboxes.len()).map(|i| {
+                bboxes
+                    .get(i)
+                    .map(|bbox| bbox_from_u32_arrow_array(bbox.u32().unwrap()))
+            }))
+        };
+        let result = crop_images(self, &mut bboxes_iterator);
+
+        image_array_from_img_buffers(self.name(), result.into_iter(), Some(*self.image_mode()))
+    }
+
+    fn resize_to_fixed_shape_image_array(
+        &self,
+        w: u32,
+        h: u32,
+        mode: &ImageMode,
+    ) -> DaftResult<FixedShapeImageArray> {
+        let result = resize_images(self, w, h);
+        fixed_image_array_from_img_buffers(self.name(), result.as_slice(), mode, h, w)
+    }
+
+    fn to_mode(&self, mode: ImageMode) -> DaftResult<Self>
+    where
+        Self: Sized,
+    {
+        let buffers: Vec<Option<CowImage>> = (0..self.len())
+            .into_par_iter()
+            .map(|i| self.as_image_obj(i).map(|img| img.into_mode(mode)))
+            .collect();
+
+        let (height, width) = match self.data_type() {
+            DataType::FixedShapeImage(_, h, w) => (h, w),
+            _ => unreachable!("self should always be a FixedShapeImage"),
+        };
+        fixed_image_array_from_img_buffers(self.name(), &buffers, &mode, *height, *width)
+    }
+
+    fn attribute(&self, attr: ImageProperty) -> DaftResult<DataArray<UInt32Type>> {
+        let (height, width) = match self.data_type() {
+            DataType::FixedShapeImage(_, h, w) => (h, w),
+            _ => unreachable!("Should be FixedShapeImage type"),
+        };
+
+        match attr {
+            ImageProperty::Height => Ok(UInt32Array::from_slice(
+                self.name(),
+                &vec![*height; self.len()],
+            )),
+            ImageProperty::Width => Ok(UInt32Array::from_slice(
+                self.name(),
+                &vec![*width; self.len()],
+            )),
+            ImageProperty::Channel => Ok(UInt32Array::from_slice(
+                self.name(),
+                &vec![self.image_mode().num_channels() as u32; self.len()],
+            )),
+            ImageProperty::Mode => Ok(UInt32Array::from_slice(
+                self.name(),
+                &vec![(*self.image_mode() as u8) as u32; self.len()],
+            )),
+        }
+    }
+}
+
+fn encode_images<Arr: AsImageObj>(
+    images: &Arr,
+    image_format: ImageFormat,
+) -> DaftResult<BinaryArray> {
+    if image_format == ImageFormat::TIFF {
+        // NOTE: A single writer/buffer can't be used for TIFF files because the encoder will overwrite the
+        // IFD offset for the first image instead of writing it for all subsequent images, producing corrupted
+        // TIFF files. We work around this by writing out a new buffer for each image.
+        // TODO(Clark): Fix this in the tiff crate.
+        let values = ImageBufferIter::new(images)
+            .map(|img| {
+                img.map(|img| {
+                    let buf = Vec::new();
+                    let mut writer: CountingWriter<std::io::BufWriter<_>> =
+                        std::io::BufWriter::new(std::io::Cursor::new(buf)).into();
+                    img.encode(image_format, &mut writer)?;
+                    // NOTE: BufWriter::into_inner() will flush the buffer.
+                    Ok(writer
+                        .into_inner()
+                        .into_inner()
+                        .map_err(|e| {
+                            DaftError::ValueError(format!(
+                                "Encoding image into file format {image_format} failed: {e}"
+                            ))
+                        })?
+                        .into_inner())
+                })
+                .transpose()
+            })
+            .collect::<DaftResult<Vec<_>>>()?;
+        Ok(BinaryArray::from_iter(images.name(), values.into_iter()))
+    } else {
+        // For non-TIFF formats, use a single buffer with manual offset/validity tracking for efficiency
+        let mut offsets = OffsetBufferBuilder::<i64>::new(images.len());
+        let mut null_builder = BooleanBufferBuilder::new(images.len());
+        let buf = Vec::new();
+        let mut writer: CountingWriter<std::io::BufWriter<_>> =
+            std::io::BufWriter::new(std::io::Cursor::new(buf)).into();
+        let mut last_offset: u64 = 0;
+        ImageBufferIter::new(images)
+            .map(|img| {
+                if let Some(img) = img {
+                    img.encode(image_format, &mut writer)?;
+                    let current_offset = writer.count();
+                    offsets.push_length((current_offset - last_offset) as usize);
+                    last_offset = current_offset;
+                    null_builder.append(true);
+                } else {
+                    offsets.push_length(0);
+                    null_builder.append(false);
+                }
+                Ok(())
+            })
+            .collect::<DaftResult<Vec<_>>>()?;
+        // NOTE: BufWriter::into_inner() will flush the buffer.
+        let values = writer
+            .into_inner()
+            .into_inner()
+            .map_err(|e| {
+                DaftError::ValueError(format!(
+                    "Encoding image into file format {image_format} failed: {e}"
+                ))
+            })?
+            .into_inner();
+        let arrow_array = LargeBinaryArray::new(
+            offsets.finish(),
+            values.into(),
+            Some(null_builder.finish().into()),
+        );
+        BinaryArray::from_arrow(
+            Field::new(images.name(), DataType::Binary),
+            Arc::new(arrow_array),
+        )
+    }
+}
+
+fn resize_images<Arr: AsImageObj + Sync>(
+    images: &Arr,
+    w: u32,
+    h: u32,
+) -> Vec<Option<CowImage<'_>>> {
+    (0..images.len())
+        .into_par_iter()
+        .map(|i| images.as_image_obj(i).map(|img| img.resize(w, h)))
+        .collect()
+}
+
+fn crop_images<'a, Arr>(
+    images: &'a Arr,
+    bboxes: &mut dyn Iterator<Item = Option<BBox>>,
+) -> Vec<Option<CowImage<'a>>>
+where
+    Arr: AsImageObj + Sync,
+{
+    let bboxes: Vec<Option<BBox>> = bboxes.take(images.len()).collect();
+    (0..images.len())
+        .into_par_iter()
+        .zip(bboxes.into_par_iter())
+        .map(|(i, bbox)| match (images.as_image_obj(i), bbox) {
+            (None, _) | (_, None) => None,
+            (Some(img), Some(bbox)) => Some(img.crop(&bbox)),
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn image_html_value(arr: &ImageArray, idx: usize, truncate: bool) -> String {
+    let maybe_image = arr.as_image_obj(idx);
+    let str_val = arr.str_value(idx).unwrap();
+
+    match maybe_image {
+        None => "None".to_string(),
+        Some(image) => {
+            let processed_image = if truncate {
+                image.fit_to(128, 128)
+            } else {
+                image // Use the full-size image
+            };
+            let mut bytes: Vec<u8> = vec![];
+            let mut writer = std::io::BufWriter::new(std::io::Cursor::new(&mut bytes));
+            processed_image
+                .encode(ImageFormat::PNG, &mut writer)
+                .unwrap();
+            drop(writer);
+
+            let style = if truncate {
+                "width:auto;height:auto"
+            } else {
+                "width:100%;height:auto"
+            };
+
+            format!(
+                "<img style=\"{}\" src=\"data:image/png;base64, {}\" alt=\"{}\" />",
+                style,
+                base64::engine::general_purpose::STANDARD.encode(&mut bytes),
+                str_val,
+            )
+        }
+    }
+}
+
+#[must_use]
+pub fn fixed_image_html_value(arr: &FixedShapeImageArray, idx: usize, truncate: bool) -> String {
+    let maybe_image = arr.as_image_obj(idx);
+    let str_val = arr.str_value(idx).unwrap();
+
+    match maybe_image {
+        None => "None".to_string(),
+        Some(image) => {
+            let processed_image = if truncate {
+                image.fit_to(128, 128)
+            } else {
+                image // Use the full-size image
+            };
+            let mut bytes: Vec<u8> = vec![];
+            let mut writer = std::io::BufWriter::new(std::io::Cursor::new(&mut bytes));
+            processed_image
+                .encode(ImageFormat::PNG, &mut writer)
+                .unwrap();
+            drop(writer);
+
+            let style = if truncate {
+                "width:auto;height:auto"
+            } else {
+                "width:100%;height:auto"
+            };
+
+            format!(
+                "<img style=\"{}\" src=\"data:image/png;base64, {}\" alt=\"{}\" />",
+                style,
+                base64::engine::general_purpose::STANDARD.encode(&mut bytes),
+                str_val,
+            )
+        }
+    }
+}
